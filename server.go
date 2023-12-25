@@ -3,14 +3,16 @@ package rpc
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"rpc/codec"
-	"rpc/service"
 	"strings"
 	"sync"
+	"time"
 )
 
 // MagicNumber 用来标识当前请求
@@ -18,13 +20,16 @@ const MagicNumber = 0x3bef5c
 
 // Option 消息的编解码方式
 type Option struct {
-	MagicNumber int        // 用来表示是当前需要的请求
-	CodecType   codec.Type // 编码方式
+	MagicNumber    int        // 用来表示是当前需要的请求
+	CodecType      codec.Type // 编码方式
+	ConnectTimeout time.Duration
+	HandleTimeout  time.Duration
 }
 
 var DefaultOption = &Option{
-	MagicNumber: MagicNumber,
-	CodecType:   codec.GobType,
+	MagicNumber:    MagicNumber,
+	CodecType:      codec.GobType,
+	ConnectTimeout: time.Second * 10,
 }
 
 // Server /*
@@ -43,9 +48,9 @@ func NewServer() *Server {
 }
 
 func (s *Server) Register(val interface{}) error {
-	service := service.NewService(val)
-	if _, dup := s.serviceMap.LoadOrStore(service.Name, service); dup {
-		return errors.New("RPC 服务已定义:" + service.Name)
+	newService := NewService(val)
+	if _, dup := s.serviceMap.LoadOrStore(newService.Name, newService); dup {
+		return errors.New("RPC 服务已定义:" + newService.Name)
 	}
 	return nil
 }
@@ -54,7 +59,7 @@ func Register(val interface{}) error {
 	return DefaultServer.Register(val)
 }
 
-func (s *Server) findService(serviceMethod string) (svc *service.Service, mtype *service.MethodType, err error) {
+func (s *Server) findService(serviceMethod string) (svc *Service, mtype *MethodType, err error) {
 	dot := strings.LastIndex(serviceMethod, ".")
 	if dot < 0 {
 		err = errors.New("RPC 服务: 服务/方法请求格式不对" + serviceMethod)
@@ -66,7 +71,7 @@ func (s *Server) findService(serviceMethod string) (svc *service.Service, mtype 
 		err = errors.New(":RPC 服务: 找不到服务:" + serviceName)
 		return
 	}
-	svc = svci.(*service.Service)
+	svc = svci.(*Service)
 	mtype = svc.Method[methodName]
 	if mtype == nil {
 		err = errors.New("RPC 服务: 找不到方法:" + methodName)
@@ -117,13 +122,13 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 		log.Printf("RPC 服务器：无效的编解码器类型%s", opt.CodecType)
 		return
 	}
-	s.serveCodec(f(conn))
+	s.serveCodec(f(conn), &opt)
 }
 
 // 发生错误响应时的argv占位符
 var invalidRequest = struct{}{}
 
-func (s *Server) serveCodec(cc codec.Codec) {
+func (s *Server) serveCodec(cc codec.Codec, opt *Option) {
 	// 确保发送完整的回复
 	sending := new(sync.Mutex)
 	// 等到所有请求都处理完毕
@@ -141,7 +146,7 @@ func (s *Server) serveCodec(cc codec.Codec) {
 			continue
 		}
 		wg.Add(1)
-		go s.handleRequest(cc, req, sending, wg)
+		go s.handleRequest(cc, req, sending, wg, opt.HandleTimeout)
 	}
 	wg.Wait()
 	_ = cc.Close()
@@ -150,14 +155,14 @@ func (s *Server) serveCodec(cc codec.Codec) {
 type request struct {
 	h           *codec.Header // 请求头
 	argv, reply reflect.Value // 请求的参数和答复
-	mtype       *service.MethodType
-	svc         *service.Service
+	mtype       *MethodType
+	svc         *Service
 }
 
 func (s *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
 	var h codec.Header
 	if err := cc.ReadHeader(&h); err != nil {
-		if err != io.EOF && !errors.Is(err, io.ErrUnexpectedEOF) {
+		if err != io.EOF && err != io.ErrUnexpectedEOF {
 			log.Println("RPC 服务器：读取标头错误:", err)
 		}
 		return nil, err
@@ -196,13 +201,67 @@ func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{},
 	}
 }
 
-func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup, timeout time.Duration) {
 	defer wg.Done()
-	err := req.svc.Call(req.mtype, req.argv, req.reply)
-	if err != nil {
-		req.h.Error = err.Error()
-		s.sendResponse(cc, req.h, invalidRequest, sending)
+	called := make(chan struct{})
+	sent := make(chan struct{})
+	go func() {
+		err := req.svc.Call(req.mtype, req.argv, req.reply)
+		if err != nil {
+			req.h.Error = err.Error()
+			s.sendResponse(cc, req.h, invalidRequest, sending)
+			return
+		}
+		s.sendResponse(cc, req.h, req.reply.Interface(), sending)
+		sent <- struct{}{}
+	}()
+	if timeout == 0 {
+		<-called
+		<-sent
 		return
 	}
-	s.sendResponse(cc, req.h, req.reply.Interface(), sending)
+	/*
+		需要确保 sendResponse 仅调用一次，因此将整个过程拆分为 called 和 sent 两个阶段，在这段代码中只会发生如下两种情况
+			1. called 信道接收到消息，代表处理没有超时，继续执行 sendResponse。
+			2. time.After() 先于 called 接收到消息，说明处理已经超时，called 和 sent 都将被阻塞。在 case <-time.After(timeout) 处调用 sendResponse。
+	*/
+	select {
+	case <-time.After(timeout):
+		req.h.Error = fmt.Sprintf("RPC 服务端请求处理超时")
+		s.sendResponse(cc, req.h, invalidRequest, sending)
+	case <-called:
+		<-sent
+	}
+}
+
+const (
+	Connected        = "200 Connected to Go RPC"
+	DefaultRPCPath   = "/_gorpc_"
+	DefaultDebugPath = "/debug/gorpc"
+)
+
+func (s *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("RPC Hijack", req.RemoteAddr, ": ", err.Error())
+		return
+	}
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+Connected+"\n\n")
+	s.ServeConn(conn)
+}
+
+func (s *Server) HandleHTTP() {
+	http.Handle(DefaultRPCPath, s)
+	http.Handle(DefaultDebugPath, debugHTTP{s})
+	log.Println("RPC 服务debug路径:", DefaultDebugPath)
+}
+
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
 }

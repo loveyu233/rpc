@@ -1,4 +1,4 @@
-package service
+package rpc
 
 import (
 	"go/ast"
@@ -21,9 +21,9 @@ func (m *MethodType) NumCalls() uint64 {
 func (m *MethodType) NewArgv() reflect.Value {
 	var argv reflect.Value
 	if m.ArgType.Kind() == reflect.Ptr {
-		argv = reflect.New(m.ArgType.Elem())
+		argv = reflect.New(m.ArgType).Elem()
 	} else {
-		argv = reflect.New(m.ArgType.Elem())
+		argv = reflect.New(m.ArgType).Elem()
 	}
 	return argv
 }
@@ -47,7 +47,7 @@ type Service struct {
 }
 
 // registerMethods 过滤出了符合条件的方法
-func (s Service) registerMethods() {
+func (s *Service) registerMethods() {
 	s.Method = make(map[string]*MethodType)
 	for i := 0; i < s.Typ.NumMethod(); i++ {
 		method := s.Typ.Method(i)
@@ -58,16 +58,16 @@ func (s Service) registerMethods() {
 		if mType.Out(0) != reflect.TypeOf((*error)(nil)).Elem() {
 			continue
 		}
-		argTye, replyTupe := mType.In(1), mType.In(2)
-		if !isExportedOrBuiltinType(argTye) || !isExportedOrBuiltinType(replyTupe) {
+		argTye, replyType := mType.In(1), mType.In(2)
+		if !isExportedOrBuiltinType(argTye) || !isExportedOrBuiltinType(replyType) {
 			continue
 		}
 		s.Method[method.Name] = &MethodType{
 			Method:    method,
 			ArgType:   argTye,
-			ReplyType: replyTupe,
+			ReplyType: replyType,
 		}
-		log.Printf("RPC 服务注册: %s.%s\n", s.Name, s.Method)
+		log.Printf("RPC 服务注册: %s.%s\n", s.Name, method.Name)
 	}
 }
 
