@@ -20,10 +20,10 @@ const MagicNumber = 0x3bef5c
 
 // Option 消息的编解码方式
 type Option struct {
-	MagicNumber    int        // 用来表示是当前需要的请求
-	CodecType      codec.Type // 编码方式
-	ConnectTimeout time.Duration
-	HandleTimeout  time.Duration
+	MagicNumber    int           // 请求标志
+	CodecType      codec.Type    // 编码方式
+	ConnectTimeout time.Duration // 连接超时
+	HandleTimeout  time.Duration // 处理超时
 }
 
 var DefaultOption = &Option{
@@ -47,39 +47,6 @@ func NewServer() *Server {
 	return new(Server)
 }
 
-func (s *Server) Register(val interface{}) error {
-	newService := NewService(val)
-	if _, dup := s.serviceMap.LoadOrStore(newService.Name, newService); dup {
-		return errors.New("RPC 服务已定义:" + newService.Name)
-	}
-	return nil
-}
-
-func Register(val interface{}) error {
-	return DefaultServer.Register(val)
-}
-
-func (s *Server) findService(serviceMethod string) (svc *Service, mtype *MethodType, err error) {
-	dot := strings.LastIndex(serviceMethod, ".")
-	if dot < 0 {
-		err = errors.New("RPC 服务: 服务/方法请求格式不对" + serviceMethod)
-		return
-	}
-	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
-	svci, ok := s.serviceMap.Load(serviceName)
-	if !ok {
-		err = errors.New(":RPC 服务: 找不到服务:" + serviceName)
-		return
-	}
-	svc = svci.(*Service)
-	mtype = svc.Method[methodName]
-	if mtype == nil {
-		err = errors.New("RPC 服务: 找不到方法:" + methodName)
-		return
-	}
-	return
-}
-
 // DefaultServer 默认的服务实例
 var DefaultServer = NewServer()
 
@@ -97,10 +64,15 @@ func (s *Server) Accept(lis net.Listener) {
 }
 
 // Accept 默认服务的请求连接
+/*
+	lis, _ := net.Listen("tcp", ":9999")
+	rpc.Accept(lis)
+*/
 func Accept(lis net.Listener) {
 	DefaultServer.Accept(lis)
 }
 
+// ServeConn 连接处理
 func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 	defer func() {
 		_ = conn.Close()
@@ -155,10 +127,34 @@ func (s *Server) serveCodec(cc codec.Codec, opt *Option) {
 type request struct {
 	h           *codec.Header // 请求头
 	argv, reply reflect.Value // 请求的参数和答复
-	mtype       *MethodType
+	methodType  *MethodType
 	svc         *Service
 }
 
+func (s *Server) readRequest(cc codec.Codec) (*request, error) {
+	header, err := s.readRequestHeader(cc)
+	if err != nil {
+		return nil, err
+	}
+	req := &request{h: header}
+
+	req.svc, req.methodType, err = s.findService(header.ServiceMethod)
+	if err != nil {
+		return req, err
+	}
+	req.argv = req.methodType.NewArgv()
+	req.reply = req.methodType.NewReply()
+	argvi := req.argv.Interface()
+	if req.argv.Type().Kind() != reflect.Ptr {
+		argvi = req.argv.Addr().Interface()
+	}
+	if err = cc.ReadBody(argvi); err != nil {
+		log.Println("RPC 服务器：读取 argv 错误:", err)
+	}
+	return req, nil
+}
+
+// readRequestHeader 读取请求头信息
 func (s *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
 	var h codec.Header
 	if err := cc.ReadHeader(&h); err != nil {
@@ -170,27 +166,37 @@ func (s *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
 	return &h, nil
 }
 
-func (s *Server) readRequest(cc codec.Codec) (*request, error) {
-	header, err := s.readRequestHeader(cc)
-	if err != nil {
-		return nil, err
+func (s *Server) findService(serviceMethod string) (svc *Service, mtype *MethodType, err error) {
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		err = errors.New("RPC 服务: 服务/方法请求格式不对" + serviceMethod)
+		return
 	}
-	req := &request{h: header}
+	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
+	svci, ok := s.serviceMap.Load(serviceName)
+	if !ok {
+		err = errors.New(":RPC 服务: 找不到服务:" + serviceName)
+		return
+	}
+	svc = svci.(*Service)
+	mtype = svc.Method[methodName]
+	if mtype == nil {
+		err = errors.New("RPC 服务: 找不到方法:" + methodName)
+		return
+	}
+	return
+}
 
-	req.svc, req.mtype, err = s.findService(header.ServiceMethod)
-	if err != nil {
-		return req, err
+func (s *Server) Register(val interface{}) error {
+	newService := NewService(val)
+	if _, dup := s.serviceMap.LoadOrStore(newService.Name, newService); dup {
+		return errors.New("RPC 服务已定义:" + newService.Name)
 	}
-	req.argv = req.mtype.NewArgv()
-	req.reply = req.mtype.NewReply()
-	argvi := req.argv.Interface()
-	if req.argv.Type().Kind() != reflect.Ptr {
-		argvi = req.argv.Addr().Interface()
-	}
-	if err = cc.ReadBody(argvi); err != nil {
-		log.Println("RPC 服务器：读取 argv 错误:", err)
-	}
-	return req, nil
+	return nil
+}
+
+func Register(val interface{}) error {
+	return DefaultServer.Register(val)
 }
 
 func (s *Server) sendResponse(cc codec.Codec, h *codec.Header, body interface{}, sending *sync.Mutex) {
@@ -206,7 +212,7 @@ func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex
 	called := make(chan struct{})
 	sent := make(chan struct{})
 	go func() {
-		err := req.svc.Call(req.mtype, req.argv, req.reply)
+		err := req.svc.Call(req.methodType, req.argv, req.reply)
 		if err != nil {
 			req.h.Error = err.Error()
 			s.sendResponse(cc, req.h, invalidRequest, sending)
